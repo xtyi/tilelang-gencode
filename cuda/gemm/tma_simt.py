@@ -1,0 +1,73 @@
+import tilelang
+import tilelang.language as T
+
+tilelang.disable_cache()
+
+PASS_CONFIGS = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
+}
+
+
+@tilelang.jit(target="cuda --arch=sm_90", pass_configs=PASS_CONFIGS)
+def gemm_ws_simt_producer(
+    A,
+    B,
+    block_m,
+    block_n,
+    block_k,
+    dtype="float16",
+    accum_dtype="float32",
+    num_stages=2,
+):
+    M, N, K = T.const("M N K")
+    A: T.Tensor[[M, K], dtype]
+    B: T.Tensor[[K, N], dtype]
+    C = T.empty((M, N), dtype)
+
+    with T.Kernel(T.ceildiv(N, block_n), T.ceildiv(M, block_m), threads=128) as (bx, by):
+        A_shared = T.alloc_shared((block_m, block_k), dtype)
+        B_shared = T.alloc_shared((block_k, block_n), dtype)
+        C_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+
+        T.clear(C_local)
+
+        for ko in T.Pipelined(T.ceildiv(K, block_k), num_stages=num_stages):
+            # Keep one TMA-capable producer so the current tiled WS pass still fires.
+            T.copy(A[by * block_m, ko * block_k], A_shared)
+            # Force the other producer to stay as plain SIMT global->shared copy.
+            for k, j in T.Parallel(block_k, block_n):
+                B_shared[k, j] = B[ko * block_k + k, bx * block_n + j]
+            T.gemm(A_shared, B_shared, C_local)
+
+        T.copy(C_local, C[by * block_m, bx * block_n])
+
+    return C
+
+
+def main():
+    M = 1024
+    N = 1024
+    K = 1024
+    block_m = 128
+    block_n = 128
+    block_k = 32
+    num_stages = 2
+
+    kernel = gemm_ws_simt_producer.compile(
+        M=M,
+        N=N,
+        K=K,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        dtype="float16",
+        accum_dtype="float32",
+        num_stages=num_stages,
+    )
+
+    source = kernel.get_kernel_source()
+    print(source)
+
+
+if __name__ == "__main__":
+    main()
